@@ -1,0 +1,288 @@
+// Copyright (c) 2026 Noa Second
+// All rights reserved.
+#include "SharedFolderColorEditor.h"
+#include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
+#include "Misc/ConfigCacheIni.h"
+#include "HAL/FileManager.h"
+#include "ContentBrowserModule.h"
+#include "TimerManager.h"
+#include "Engine/World.h"
+#include "Editor.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonWriter.h"
+#include "Serialization/JsonSerializer.h"
+#include "JsonUtilities.h"
+#include "ISourceControlModule.h"
+#include "ISourceControlProvider.h"
+#include "SourceControlOperations.h"
+#include "HAL/PlatformFileManager.h"
+
+static bool CheckoutOrMakeWritable(const FString& FilePath)
+{
+    IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+    if (!PlatformFile.FileExists(*FilePath))
+    {
+        return true;
+    }
+
+    if (!PlatformFile.IsReadOnly(*FilePath))
+    {
+        return true;
+    }
+
+    if (ISourceControlModule::Get().IsEnabled())
+    {
+        ISourceControlProvider& SourceControlProvider = ISourceControlModule::Get().GetProvider();
+        FSourceControlStatePtr SourceControlState = SourceControlProvider.GetState(FilePath, EStateCacheUsage::ForceUpdate);
+        if (SourceControlState.IsValid())
+        {
+            if (SourceControlState->CanCheckout())
+            {
+                TSharedRef<FCheckOut, ESPMode::ThreadSafe> CheckoutOp = ISourceControlOperation::Create<FCheckOut>();
+                if (SourceControlProvider.Execute(CheckoutOp, FilePath) == ECommandResult::Succeeded)
+                {
+                    UE_LOG(LogTemp, Log, TEXT("SharedFolderColor: Successfully checked out %s"), *FilePath);
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (PlatformFile.SetReadOnly(*FilePath, false))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("SharedFolderColor: Made file writable (cleared read-only attribute): %s"), *FilePath);
+        return true;
+    }
+
+    return false;
+}
+
+static void MarkForAddIfSourceControlEnabled(const FString& FilePath)
+{
+    if (ISourceControlModule::Get().IsEnabled())
+    {
+        ISourceControlProvider& SourceControlProvider = ISourceControlModule::Get().GetProvider();
+        FSourceControlStatePtr SourceControlState = SourceControlProvider.GetState(FilePath, EStateCacheUsage::ForceUpdate);
+        if (SourceControlState.IsValid() && !SourceControlState->IsSourceControlled())
+        {
+            TSharedRef<FMarkForAdd, ESPMode::ThreadSafe> MarkForAddOp = ISourceControlOperation::Create<FMarkForAdd>();
+            SourceControlProvider.Execute(MarkForAddOp, FilePath);
+            UE_LOG(LogTemp, Log, TEXT("SharedFolderColor: Marked %s for add in source control"), *FilePath);
+        }
+    }
+}
+
+static FString GetSharedColorsPath()
+{
+    return FPaths::Combine(FPaths::ProjectConfigDir(), TEXT("SharedFolderColors.json"));
+}
+
+static FString GetColorIniSection()
+{
+    return TEXT("PathColor");
+}
+
+void FSharedFolderColorEditorModule::StartupModule()
+{
+    // Load and apply colors automatically at startup
+    LoadAndApplyColors();
+
+    // Listen for folder color changes so the shared JSON updates immediately.
+    FContentBrowserModule& ContentBrowserModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser"));
+    SetFolderColorDelegateHandle = ContentBrowserModule.GetOnSetFolderColor().AddRaw(this, &FSharedFolderColorEditorModule::OnFolderColorChanged);
+
+    // Export immediately so the shared file exists as soon as the plugin loads
+    ExportColors();
+
+    // Set up a timer to check for changes every 2 seconds and auto-export
+    if (GEditor)
+    {
+        FTimerDelegate AutoExportDelegate;
+        AutoExportDelegate = FTimerDelegate::CreateRaw(this, &FSharedFolderColorEditorModule::CheckAndExportColors);
+
+        GEditor->GetTimerManager()->SetTimer(
+            AutoExportTimerHandle,
+            AutoExportDelegate,
+            2.0f,
+            true  // Loop
+        );
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("SharedFolderColor plugin loaded - colors will be synchronized automatically"));
+}
+
+void FSharedFolderColorEditorModule::ShutdownModule()
+{
+    if (SetFolderColorDelegateHandle.IsValid() && FModuleManager::Get().IsModuleLoaded(TEXT("ContentBrowser")))
+    {
+        FContentBrowserModule& ContentBrowserModule = FModuleManager::GetModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser"));
+        ContentBrowserModule.GetOnSetFolderColor().Remove(SetFolderColorDelegateHandle);
+    }
+
+    if (GEditor && AutoExportTimerHandle.IsValid())
+    {
+        GEditor->GetTimerManager()->ClearTimer(AutoExportTimerHandle);
+    }
+
+    if (GEditor && PendingExportTimerHandle.IsValid())
+    {
+        GEditor->GetTimerManager()->ClearTimer(PendingExportTimerHandle);
+    }
+
+    // Final export before shutdown
+    ExportColors();
+
+    UE_LOG(LogTemp, Warning, TEXT("SharedFolderColor plugin unloaded"));
+}
+
+void FSharedFolderColorEditorModule::LoadAndApplyColors()
+{
+    const FString Path = GetSharedColorsPath();
+    const FString Section = GetColorIniSection();
+
+    // If the shared colors file exists, load it
+    if (FPaths::FileExists(Path))
+    {
+        FString Input;
+        if (FFileHelper::LoadFileToString(Input, *Path))
+        {
+            TSharedPtr<FJsonObject> Root;
+            TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Input);
+            
+            if (FJsonSerializer::Deserialize(Reader, Root) && Root.IsValid())
+            {
+                // Write all colors to the project ini so they persist and can be version controlled
+                for (const auto& Pair : Root->Values)
+                {
+                    FString Key = Pair.Key;
+                    FString Value;
+                    if (Pair.Value.IsValid() && Pair.Value->Type == EJson::String)
+                    {
+                        Value = Pair.Value->AsString();
+                        GConfig->SetString(*Section, *Key, *Value, GEditorPerProjectIni);
+                    }
+                }
+                GConfig->Flush(false, GEditorPerProjectIni);
+
+                LastImportedSharedColorsState = Input;
+                LastExportedState = BuildCurrentColorState();
+                
+                UE_LOG(LogTemp, Warning, TEXT("SharedFolderColor: Loaded %d colors from %s"), Root->Values.Num(), *Path);
+            }
+        }
+    }
+}
+
+void FSharedFolderColorEditorModule::CheckAndExportColors()
+{
+    if (HasSharedColorsFileChanged())
+    {
+        LoadAndApplyColors();
+    }
+
+    if (HasColorsChanged())
+    {
+        ExportColors();
+    }
+}
+
+void FSharedFolderColorEditorModule::OnFolderColorChanged(const FString& FolderPath)
+{
+    UE_LOG(LogTemp, Verbose, TEXT("SharedFolderColor: folder color changed for %s"), *FolderPath);
+    ScheduleExport();
+}
+
+void FSharedFolderColorEditorModule::ScheduleExport()
+{
+    if (!GEditor)
+    {
+        ExportColors();
+        return;
+    }
+
+    FTimerDelegate ExportDelegate = FTimerDelegate::CreateRaw(this, &FSharedFolderColorEditorModule::ExportColors);
+    GEditor->GetTimerManager()->ClearTimer(PendingExportTimerHandle);
+    GEditor->GetTimerManager()->SetTimer(PendingExportTimerHandle, ExportDelegate, 0.25f, false);
+}
+
+bool FSharedFolderColorEditorModule::HasColorsChanged() const
+{
+    return BuildCurrentColorState() != LastExportedState;
+}
+
+bool FSharedFolderColorEditorModule::HasSharedColorsFileChanged() const
+{
+    const FString Path = GetSharedColorsPath();
+    if (!FPaths::FileExists(Path))
+    {
+        return false;
+    }
+
+    FString Input;
+    return FFileHelper::LoadFileToString(Input, *Path) && Input != LastImportedSharedColorsState;
+}
+
+FString FSharedFolderColorEditorModule::BuildCurrentColorState() const
+{
+    const FString Section = GetColorIniSection();
+
+    TArray<FString> SectionLines;
+    GConfig->GetSection(*Section, SectionLines, GEditorPerProjectIni);
+
+    FString CurrentState;
+    for (const FString& Line : SectionLines)
+    {
+        CurrentState += Line + TEXT("\n");
+    }
+
+    return CurrentState;
+}
+
+void FSharedFolderColorEditorModule::ExportColors()
+{
+    const FString Section = GetColorIniSection();
+    
+    TArray<FString> SectionLines;
+    GConfig->GetSection(*Section, SectionLines, GEditorPerProjectIni);
+
+    TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject());
+
+    for (const FString& Line : SectionLines)
+    {
+        FString Key, Value;
+        if (Line.Split(TEXT("="), &Key, &Value))
+        {
+            // Remove quotes if present
+            Value.RemoveFromStart(TEXT("\""));
+            Value.RemoveFromEnd(TEXT("\""));
+            Root->SetStringField(Key, Value);
+        }
+    }
+
+    FString Output;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+    if (FJsonSerializer::Serialize(Root.ToSharedRef(), Writer))
+    {
+        const FString Path = GetSharedColorsPath();
+        
+        CheckoutOrMakeWritable(Path);
+        const bool bFileExists = FPlatformFileManager::Get().GetPlatformFile().FileExists(*Path);
+
+        if (FFileHelper::SaveStringToFile(Output, *Path))
+        {
+            LastExportedState = BuildCurrentColorState();
+            LastImportedSharedColorsState = Output;
+            UE_LOG(LogTemp, Warning, TEXT("SharedFolderColor: Auto-exported %d colors to %s"), Root->Values.Num(), *Path);
+
+            if (!bFileExists)
+            {
+                MarkForAddIfSourceControlEnabled(Path);
+            }
+        }
+    }
+}
+
+IMPLEMENT_MODULE(FSharedFolderColorEditorModule, SharedFolderColorEditor)
+
+
